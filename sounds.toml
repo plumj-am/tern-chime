@@ -1,0 +1,21 @@
+# Chime sounds: alert, yield and done take a path to an audio file.
+# Paths are relative to this file when the config lives in the plugin folder
+# (sounds/... reach the bundled chimes); use absolute or ~/ paths in
+# <plugin data>/sounds.toml, which overrides this file. An empty path ("")
+# silences that trigger.
+#
+# Windows plays WAV only (Media.SoundPlayer); macOS and Linux play whatever
+# their player reads (afplay; paplay/aplay/ffplay/play). Edit freely; Chime
+# re-reads the config every few seconds and the Reload palette command
+# refreshes it at once.
+alert = "sounds/alert.wav"
+yield = "sounds/yield.wav"
+done = "sounds/done.wav"
+
+# Chime only for panes you are not looking at. false chimes for the focused
+# pane too.
+only_unfocused = true
+
+# Shell commands running at least this long chime the done sound when they
+# finish. 0 chimes every finished command.
+min_seconds = 30

@@ -15,23 +15,53 @@ For development, `tern plugin link /path/to/tern-chime`.
 
 ## Sounds
 
-Custom sounds are the point: `sounds.toml` in the plugin folder names the
+Custom sounds are the point. `sounds.toml` in the plugin folder names the
 audio file per trigger, and `<plugin data>/sounds.toml` overrides it so a
-reinstall keeps your sounds. Paths there can be absolute or `~/`-relative; an
-empty path silences that trigger. The config re-reads every few seconds, and
-**Chime: Reload sounds** refreshes it at once.
+reinstall keeps your sounds. In your override, paths can be absolute,
+`~/`-relative, or relative to the plugin data folder (handy for a `sounds/`
+folder next to the config); an empty path silences that trigger. The config
+re-reads every few seconds, and **Chime: Reload sounds** refreshes it at once.
+
+The bundled chimes in `sounds/` are synthesized in-repo and free to keep, but
+they are just defaults. To use the Mac "Funk" alert sound, for example:
+
+1. Save a `Funk.aiff` (from `/System/Library/Sounds` on a Mac, or any
+   recording of it) next to your override config:
+   `<plugin data>/sounds/Funk.aiff`. (`tern plugin dir` shows the plugins
+   folder; plugin data lives under Tern's local data folder, e.g.
+   `%LOCALAPPDATA%\Tern\plugin-data\chime` on Windows.)
+2. On Windows, convert it to WAV first — `Media.SoundPlayer` plays WAV only:
+   `ffmpeg -i Funk.aiff -ar 44100 -ac 1 Funk.wav`. macOS (`afplay`) and Linux
+   (`paplay`/`aplay`/`ffplay`/`play`) play whatever their player reads.
+3. Point the triggers at it:
 
 ```toml
-alert = "C:/sounds/ping.wav"   # terminal bell, agent waiting, pane alert
-yield = "~/sounds/done.wav"    # omp agent yielded its turn
-done = ""                      # long commands: silent
-only_unfocused = true          # chime only for panes you aren't looking at
-min_seconds = 30               # commands running this long chime done
+# <plugin data>/sounds.toml
+alert = "sounds/Funk.wav"   # terminal bell, agent waiting, pane alert
+yield = "sounds/Funk.wav"    # omp agent yielded its turn
+done = ""                     # long commands: silent
+only_unfocused = true         # chime only for panes you aren't looking at
+min_seconds = 30              # commands running this long chime done
 ```
 
-Windows plays WAV only; macOS and Linux play whatever their player reads. The
-bundled chimes live in `sounds/` and are synthesized, so they are free to keep
-or replace.
+More recipes:
+
+```toml
+# One shared chime for everything, including the focused pane:
+alert = "~/sounds/ping.wav"
+yield = "~/sounds/ping.wav"
+done = "~/sounds/ping.wav"
+only_unfocused = false
+min_seconds = 0
+```
+
+```toml
+# Silent agent yields; only waiting agents and long builds make noise:
+alert = "C:/sounds/alarm.wav"
+yield = ""
+done = "C:/sounds/ta-da.wav"
+min_seconds = 120
+```
 
 ## Palette
 

@@ -312,16 +312,10 @@ local function play_file(path: string)
 	if os_name == "ios" then
 		return
 	elseif os_name == "windows" then
-		-- Hidden so no console window flashes; SoundPlayer takes WAV only.
-		spawn({
-			"powershell",
-			"-NoProfile",
-			"-NonInteractive",
-			"-WindowStyle",
-			"Hidden",
-			"-Command",
-			"(New-Object Media.SoundPlayer '" .. string.gsub(path, "'", "''") .. "').PlaySync()",
-		}, path)
+		-- Via wscript (a windowless GUI host): spawning hidden PowerShell
+		-- directly still flashes a console box on creation. SoundPlayer
+		-- takes WAV only.
+		spawn({ "wscript.exe", "//Nologo", tern.plugin.dir .. SEP .. "scripts" .. SEP .. "play.vbs", path }, path)
 	elseif os_name == "macos" then
 		spawn({ "afplay", path }, path)
 	elseif os_name == "linux" then

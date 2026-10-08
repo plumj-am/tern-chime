@@ -13,6 +13,18 @@ tern plugin install https://github.com/H4vC/tern-chime
 
 For development, `tern plugin link /path/to/tern-chime`.
 
+## Platforms
+
+| OS | Player | Notes |
+|---|---|---|
+| Windows | `Media.SoundPlayer` via a hidden `wscript` launcher | WAV only; no console flash |
+| macOS | `afplay` (ships with the OS) | Plays whatever afplay reads |
+| Linux | `pw-play` → `paplay` → `aplay` → `ffplay` → `play`, first found wins | PipeWire-native first; on a bare server install one of `pipewire-bin`, `pulseaudio-utils`, `alsa-utils`, `ffmpeg` or `sox` |
+| iOS | — | Silent; sound playback isn't available to plugins |
+
+On Linux without any player, Chime logs one warning and stays silent rather
+than erroring on every trigger.
+
 ## Sounds
 
 Custom sounds are the point. `sounds.toml` in the plugin folder names the
@@ -31,8 +43,8 @@ they are just defaults. To use the Mac "Funk" alert sound, for example:
    folder; plugin data lives under Tern's local data folder, e.g.
    `%LOCALAPPDATA%\Tern\plugin-data\chime` on Windows.)
 2. On Windows, convert it to WAV first — `Media.SoundPlayer` plays WAV only:
-   `ffmpeg -i Funk.aiff -ar 44100 -ac 1 Funk.wav`. macOS (`afplay`) and Linux
-   (`paplay`/`aplay`/`ffplay`/`play`) play whatever their player reads.
+   `ffmpeg -i Funk.aiff -ar 44100 -ac 1 Funk.wav`. macOS and Linux play
+   whatever their player reads (see Platforms above).
 3. Point the triggers at it:
 
 ```toml

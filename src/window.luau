@@ -262,6 +262,10 @@ local linux_probe_failed = false
 local linux_probing = false
 local linux_queue: { string } = {}
 
+-- Preference order: PipeWire-native first (pw-play ships with pipewire),
+-- then PulseAudio, ALSA, then the heavy/general players.
+local LINUX_PLAYERS = { "pw-play", "paplay", "aplay", "ffplay", "play" }
+
 local function linux_argv(player: string, path: string): { string }
 	if player == "ffplay" then
 		return { "ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path }
@@ -269,8 +273,10 @@ local function linux_argv(player: string, path: string): { string }
 		return { "play", "-q", path }
 	elseif player == "aplay" then
 		return { "aplay", "-q", path }
-	else
+	elseif player == "paplay" then
 		return { "paplay", path }
+	else
+		return { "pw-play", path }
 	end
 end
 
@@ -279,13 +285,16 @@ local function probe_linux_player()
 		return
 	end
 	linux_probing = true
+	-- One probe per player would serialize N spawns; instead ask sh for the
+	-- first match in preference order and read back which one answered.
+	local names = table.concat(LINUX_PLAYERS, " ")
 	local ok, err = pcall(function()
 		tern.process.run(
-			{ "sh", "-c", "command -v paplay || command -v aplay || command -v ffplay || command -v play" },
+			{ "sh", "-c", "for p in " .. names .. "; do command -v $p >/dev/null 2>&1 && { echo $p; exit 0; }; done; exit 1" },
 			{ timeout_ms = 5000 },
 			function(result: ProcessResult)
 				linux_probing = false
-				local name = string.match(result.stdout, "([^/%s\r\n]+)%s*$")
+				local name = string.match(result.stdout, "([%w-]+)")
 				if result.status == 0 and name ~= nil and name ~= "" then
 					linux_player = name
 					for _, path in linux_queue do
@@ -293,7 +302,7 @@ local function probe_linux_player()
 					end
 				else
 					linux_probe_failed = true
-					tern.log.warn("Chime: no sound player found (need paplay, aplay, ffplay or play)")
+					tern.log.warn("Chime: no sound player found (need one of: " .. names .. ")")
 				end
 				linux_queue = {}
 			end
@@ -306,6 +315,8 @@ local function probe_linux_player()
 		tern.log.warn("Chime: couldn't probe for a sound player: " .. tostring(err))
 	end
 end
+
+local warned_no_player = false
 
 local function play_file(path: string)
 	local os_name = tern.runtime.os
@@ -325,6 +336,9 @@ local function play_file(path: string)
 		elseif not linux_probe_failed then
 			table.insert(linux_queue, path)
 			probe_linux_player()
+		elseif not warned_no_player then
+			warned_no_player = true
+			tern.log.warn("Chime: silent (no Linux player; install pipewire-pulse, alsa-utils, sox or ffmpeg)")
 		end
 	else
 		tern.log.warn("Chime: no player for " .. os_name)

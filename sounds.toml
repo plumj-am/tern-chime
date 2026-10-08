@@ -4,10 +4,11 @@
 # <plugin data>/sounds.toml, which overrides this file. An empty path ("")
 # silences that trigger.
 #
-# Windows plays WAV only (Media.SoundPlayer); macOS and Linux play whatever
-# their player reads (afplay; paplay/aplay/ffplay/play). Edit freely; Chime
-# re-reads the config every few seconds and the Reload palette command
-# refreshes it at once.
+# Windows plays WAV only (Media.SoundPlayer); macOS plays whatever afplay
+# reads; Linux plays whatever the detected player reads: pw-play, paplay,
+# aplay, ffplay or play, first found wins. Edit freely; Chime re-reads the
+# config every few seconds and the Reload palette command refreshes it
+# at once.
 alert = "sounds/alert.wav"
 yield = "sounds/yield.wav"
 done = "sounds/done.wav"

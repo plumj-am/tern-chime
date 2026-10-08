@@ -2,9 +2,11 @@
 -- Chime: a sound when a pane raises an unseen alert, an agent yields to you,
 -- or a long shell command finishes.
 --
--- Triggers:
+-- Triggers (all for panes you are not looking at, unless only_unfocused=false):
 --   alert  a pane's unseen-alert flag rises: a terminal bell, an agent that
---          finished or is waiting out of sight, a finished command, an exit.
+--          finished or is waiting out of sight, or a pane whose program
+--          exited. Tern shows one alert per pane until you look at it, so a
+--          second bell while the flag stands chimes nothing new.
 --   yield  an agent block leaves "working" for "idle": its turn is done and
 --          control is back with you. (working -> "waiting_input" plays the
 --          alert sound instead: it needs you, not just your attention.)
@@ -493,10 +495,8 @@ tern.command({
 	title = "Chime: Reload sounds",
 	icon = "bell",
 	run = function(cx: WindowCx)
-		config_key = nil
-		maybe_reload_config()
-		local problems = load_config()
 		config_key = snapshot_key()
+		local problems = load_config()
 		if #problems == 0 then
 			cx:toast("info", "Chime", "Sounds reloaded from " .. config_source)
 		else

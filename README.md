@@ -1,9 +1,9 @@
 # Chime for Tern
 
 A sound when something needs you: a pane's unseen alert (terminal bell, agent
-waiting, finished command), an omp agent yielding its turn, or a long shell
-command finishing. Chimes never overlap, and one window's chime suppresses the
-same moment's chime in every other window.
+waiting or finished out of sight, exited program), an omp agent yielding its
+turn, or a long shell command finishing. Chimes never overlap, and one
+window's chime suppresses the same moment's chime in every other window.
 
 ## Install
 

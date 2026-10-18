@@ -17,12 +17,15 @@
 --
 -- Configuration is sounds.toml in the plugin folder (ships with defaults) or
 -- <plugin data>/sounds.toml, which wins when present so a reinstall keeps
--- your sounds. It is re-read every few seconds; no reload needed.
+-- your sounds. It is re-read every few seconds; no reload needed. The optional
+-- volume key (whole percent, 1-100) scales playback where the platform player
+-- takes a volume; a player without one ignores it.
 
 type Config = {
 	sounds: { [string]: string },
 	only_unfocused: boolean,
 	min_seconds: number,
+	volume: number,
 }
 
 local TICK_MS = 250
@@ -99,6 +102,7 @@ local function default_config(): Config
 		},
 		only_unfocused = true,
 		min_seconds = 30,
+		volume = 100,
 	}
 end
 
@@ -151,9 +155,16 @@ local function parse_config(text: string, base: string): (Config, { string })
 			elseif key == "min_seconds" then
 				local n = tonumber(value)
 				if n == nil or n < 0 then
-					table.insert(proproblems, "min_seconds: expected seconds >= 0, got " .. value)
+					table.insert(problems, "min_seconds: expected seconds >= 0, got " .. value)
 				else
 					config.min_seconds = n
+				end
+			elseif key == "volume" then
+				local n = tonumber(value)
+				if n == nil or n % 1 ~= 0 or n < 1 or n > 100 then
+					table.insert(problems, "volume: expected a whole number between 1 and 100, got " .. value)
+				else
+					config.volume = n
 				end
 			else
 				table.insert(problems, "Unknown key: " .. key)
@@ -266,17 +277,24 @@ local linux_queue: { string } = {}
 -- then PulseAudio, ALSA, then the heavy/general players.
 local LINUX_PLAYERS = { "pw-play", "paplay", "aplay", "ffplay", "play" }
 
-local function linux_argv(player: string, path: string): { string }
+-- Volume as a 0-1 fraction, the form pw-play, sox play and afplay take.
+local function volume_fraction(volume: number): string
+	return string.format("%.4g", volume / 100)
+end
+
+local function linux_argv(player: string, path: string, volume: number): { string }
 	if player == "ffplay" then
-		return { "ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path }
+		return { "ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-volume", tostring(volume), path }
 	elseif player == "play" then
-		return { "play", "-q", path }
+		return { "play", "-q", "-v", volume_fraction(volume), path }
 	elseif player == "aplay" then
+		-- aplay has no volume flag; it ignores the volume and plays at full volume.
 		return { "aplay", "-q", path }
 	elseif player == "paplay" then
-		return { "paplay", path }
+		-- PulseAudio takes a volume in 1/65536ths (PA_VOLUME_NORM).
+		return { "paplay", "--volume=" .. tostring(math.round(volume * 65536 / 100)), path }
 	else
-		return { "pw-play", path }
+		return { "pw-play", "--volume=" .. volume_fraction(volume), path }
 	end
 end
 
@@ -298,7 +316,7 @@ local function probe_linux_player()
 				if result.status == 0 and name ~= nil and name ~= "" then
 					linux_player = name
 					for _, path in linux_queue do
-						spawn(linux_argv(name, path), path)
+						spawn(linux_argv(name, path, config.volume), path)
 					end
 				else
 					linux_probe_failed = true
@@ -325,14 +343,15 @@ local function play_file(path: string)
 	elseif os_name == "windows" then
 		-- Via wscript (a windowless GUI host): spawning hidden PowerShell
 		-- directly still flashes a console box on creation. SoundPlayer
-		-- takes WAV only.
+		-- takes WAV only, and has no volume control, so `volume` is ignored
+		-- here (see sounds.toml).
 		spawn({ "wscript.exe", "//Nologo", tern.plugin.dir .. SEP .. "scripts" .. SEP .. "play.vbs", path }, path)
 	elseif os_name == "macos" then
-		spawn({ "afplay", path }, path)
+		spawn({ "afplay", "-v", volume_fraction(config.volume), path }, path)
 	elseif os_name == "linux" then
 		local player = linux_player
 		if player ~= nil then
-			spawn(linux_argv(player, path), path)
+			spawn(linux_argv(player, path, config.volume), path)
 		elseif not linux_probe_failed then
 			table.insert(linux_queue, path)
 			probe_linux_player()
@@ -523,6 +542,7 @@ tern.command({
 		table.insert(lines, "muted: " .. tostring(is_muted))
 		table.insert(lines, "only_unfocused: " .. tostring(config.only_unfocused))
 		table.insert(lines, "min_seconds: " .. tostring(config.min_seconds))
+		table.insert(lines, "volume: " .. tostring(config.volume) .. "%")
 		for _, kind in { "alert", "yield", "done" } do
 			local path = config.sounds[kind]
 			local mark = "(off)"

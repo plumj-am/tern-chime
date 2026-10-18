@@ -15,12 +15,12 @@ For development, `tern plugin link /path/to/tern-chime`.
 
 ## Platforms
 
-| OS | Player | Notes |
-|---|---|---|
-| Windows | `Media.SoundPlayer` via a hidden `wscript` launcher | WAV only; no console flash |
-| macOS | `afplay` (ships with the OS) | Plays whatever afplay reads |
-| Linux | `pw-play` → `paplay` → `aplay` → `ffplay` → `play`, first found wins | PipeWire-native first; on a bare server install one of `pipewire-bin`, `pulseaudio-utils`, `alsa-utils`, `ffmpeg` or `sox` |
-| iOS | — | Silent; sound playback isn't available to plugins |
+| OS | Player | Notes | Volume |
+|---|---|---|---|
+| Windows | `Media.SoundPlayer` via a hidden `wscript` launcher | WAV only; no console flash | Ignored: SoundPlayer has no volume control |
+| macOS | `afplay` (ships with the OS) | Plays whatever afplay reads | `afplay -v` |
+| Linux | `pw-play` → `paplay` → `aplay` → `ffplay` → `play`, first found wins | PipeWire-native first; on a bare server install one of `pipewire-bin`, `pulseaudio-utils`, `alsa-utils`, `ffmpeg` or `sox` | `pw-play`, `paplay`, `ffplay` and `play` take it; `aplay` ignores it |
+| iOS | — | Silent; sound playback isn't available to plugins | Silent anyway |
 
 On Linux without any player, Chime logs one warning and stays silent rather
 than erroring on every trigger.
@@ -31,8 +31,11 @@ Custom sounds are the point. `sounds.toml` in the plugin folder names the
 audio file per trigger, and `<plugin data>/sounds.toml` overrides it so a
 reinstall keeps your sounds. In your override, paths can be absolute,
 `~/`-relative, or relative to the plugin data folder (handy for a `sounds/`
-folder next to the config); an empty path silences that trigger. The config
-re-reads every few seconds, and **Chime: Reload sounds** refreshes it at once.
+folder next to the config); an empty path silences that trigger. `volume` is a
+whole percent from 1 to 100 that scales every chime; 100 is normal volume, and
+a player without volume control (Windows, `aplay`) ignores it rather than
+erroring. The config re-reads every few seconds, and **Chime: Reload sounds**
+refreshes it at once.
 
 The bundled chimes in `sounds/` are synthesized in-repo and free to keep, but
 they are just defaults. To use the Mac "Funk" alert sound, for example:
@@ -54,6 +57,7 @@ yield = "sounds/Funk.wav"    # omp agent yielded its turn
 done = ""                     # long commands: silent
 only_unfocused = true         # chime only for panes you aren't looking at
 min_seconds = 30              # commands running this long chime done
+volume = 100                  # playback volume in percent, 1-100
 ```
 
 More recipes:
@@ -65,6 +69,7 @@ yield = "~/sounds/ping.wav"
 done = "~/sounds/ping.wav"
 only_unfocused = false
 min_seconds = 0
+volume = 100
 ```
 
 ```toml
@@ -73,6 +78,7 @@ alert = "C:/sounds/alarm.wav"
 yield = ""
 done = "C:/sounds/ta-da.wav"
 min_seconds = 120
+volume = 40
 ```
 
 ## Palette

@@ -6,9 +6,10 @@
 #
 # Windows plays WAV only (Media.SoundPlayer); macOS plays whatever afplay
 # reads; Linux plays whatever the detected player reads: pw-play, paplay,
-# aplay, ffplay or play, first found wins. Edit freely; Chime re-reads the
-# config every few seconds and the Reload palette command refreshes it
-# at once.
+# aplay, ffplay or play, first found wins. Of those, only pw-play, paplay,
+# ffplay and play take the volume below; aplay and Windows have no volume
+# control. Edit freely; Chime re-reads the config every few seconds and the
+# Reload palette command refreshes it at once.
 alert = "sounds/alert.wav"
 yield = "sounds/yield.wav"
 done = "sounds/done.wav"
@@ -20,3 +21,9 @@ only_unfocused = true
 # Shell commands running at least this long chime the done sound when they
 # finish. 0 chimes every finished command.
 min_seconds = 30
+
+# Playback volume in percent, 1 to 100. 100 is normal volume. Tools with no
+# volume control ignore it: Windows (Media.SoundPlayer) and Linux aplay always
+# play at full volume, and iOS stays silent. Chime muting is a separate
+# palette command.
+volume = 100

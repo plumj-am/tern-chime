@@ -8,20 +8,19 @@
 --          exited. Tern shows one alert per pane until you look at it, so a
 --          second bell while the flag stands chimes nothing new.
 --   yield  an agent block leaves "working" for "idle": its turn is done and
---          control is back with you. (working -> "waiting_input" plays the
---          alert sound instead: it needs you, not just your attention.)
+--          control is back with you. The agent_finished event finds it.
 --   done   a shell command ran longer than min_seconds and finished.
 --
 -- The host half decides WHETHER the sound plays and plays it. It reads
--- sounds.toml, finds a sound player, owns the mute flag and owns the 500 ms
--- gap between two chimes. One host half serves every window, so a chime in
--- one window no longer has to suppress the same moment's chime in another.
+-- sounds.toml, finds a sound player, owns the mute flag and owns the claim
+-- on a moment. One host half serves every window, so a chime in one window
+-- no longer has to suppress the same moment's chime in another.
 --
 -- The two halves talk through the channel in src/shared.luau. This half
 -- asks the host half to play, and the host half answers. This half holds
--- no player, reads no configuration file and keeps no gap logic. It keeps
--- the configuration the host half sent, the cached mute flag, and the
--- requests it waits for.
+-- no player, reads no configuration file and keeps no claim logic. It
+-- keeps the configuration the host half sent, the cached mute flag, and
+-- the requests it waits for.
 --
 -- Triggers are for panes you are not looking at, unless only_unfocused=false.
 
@@ -46,14 +45,6 @@ local CONFIG_EVERY_TICKS = 20 -- ask the host half for the configuration about e
 local REQUEST_TIMEOUT_MS = 10000 -- a request with no answer is dropped
 local SWEEP_EVERY_MS = 30000 -- stale channel files are swept this often
 local SWEEP_MAX_AGE_S = 60 -- a channel file older than this is stale
-
--- Listing the agents costs about 10 to 20 ms and grows with the number of
--- agents and the size of their last answers. The window's budget is 50 ms
--- per handler, and a handler that runs over its budget is disabled until
--- the next reload, so the agent poll runs on its own, slower interval.
-local AGENT_POLL_SLOW_MS = 20 -- a poll over this is too slow for every tick
-local AGENT_POLL_FAST_MS = 10 -- a poll under this can run every tick
-local AGENT_POLL_MAX_TICKS = 16 -- at most one agent poll every 4 s
 
 local SEP = if tern.runtime.os == "windows" then "\\" else "/"
 
@@ -268,16 +259,30 @@ end
 
 -- Read the answers that arrived. A request that waits more than ten
 -- seconds is dropped.
+--
+-- The reply directory is listed once, and only the answers that are in it
+-- are read. Reading one file per pending request would make the tick grow
+-- with the number of pending requests, and a tick that runs over its
+-- budget is disabled until the next reload.
 local function collect_replies(cx: WindowCx?)
 	local now = tern.now()
+	local ok, names = pcall(tern.fs.list, shared.path(shared.REPLY_DIR))
+	if not ok or type(names) ~= "table" then
+		names = {}
+	end
+	for _, name in names do
+		local entry = pending[name]
+		if entry ~= nil then
+			local payload, status = shared.take_reply(name)
+			if status == "ok" then
+				pending[name] = nil
+				handle_reply(entry, payload, cx)
+			end
+		end
+	end
+	-- The requests that got no answer in time are dropped.
 	for name, entry in pending do
-		local payload, status = shared.take_reply(name)
-		if status == "ok" then
-			pending[name] = nil
-			handle_reply(entry, payload, cx)
-		elseif status == "corrupt" then
-			-- Half an answer: read it again on the next tick.
-		elseif now - entry.at > REQUEST_TIMEOUT_MS then
+		if now - entry.at > REQUEST_TIMEOUT_MS then
 			pending[name] = nil
 			tern.log.debug("Chime: the host half did not answer the " .. entry.op .. " request")
 			if entry.op == "config" and reload_wanted ~= nil then
@@ -301,19 +306,14 @@ end
 
 -- Triggers ------------------------------------------------------------------------------------
 
--- Ask the host half to play a sound. The host half holds the gap, the
+-- Ask the host half to play a sound. The host half holds the claim, the
 -- mute flag and the player, so it decides whether a sound comes out. The
 -- cached mute state stops this half from asking when the user muted.
---
--- The moment names the pane, the kind and the second. Two windows that
--- see the same event send the same moment, and the host half plays it
--- once.
-local function chime(kind: string, pane: number?)
+local function chime(kind: string)
 	if is_muted then
 		return
 	end
-	local moment = tostring(pane or 0) .. ":" .. kind .. ":" .. tostring(os.time())
-	ask("play", { kind = kind, moment = moment }, kind, nil)
+	ask("play", { kind = kind }, kind, nil)
 end
 
 local function list_agents(cx: WindowCx): { AgentBlock }
@@ -324,17 +324,6 @@ local function list_agents(cx: WindowCx): { AgentBlock }
 		return agents :: { AgentBlock }
 	end
 	return {}
-end
-
--- The state of one agent block, or an empty string when the pane holds no
--- agent.
-local function agent_state_of(cx: WindowCx, pane: number): string
-	for _, agent in list_agents(cx) do
-		if agent.pane == pane then
-			return agent.state
-		end
-	end
-	return ""
 end
 
 -- The pane an agent block runs in, and whether the user looks at it.
@@ -349,46 +338,17 @@ local function pane_focused(cx: WindowCx, pane: number): boolean
 end
 
 local alerts: { [number]: boolean } = {}
-local agent_state: { [number]: string } = {}
 local seeded = false
 local tick_count = 0
 
--- How many ticks pass between two agent polls. It starts at one, so a
--- quiet machine polls every tick, and it grows when the poll turns out to
--- be slow.
-local agent_poll_ticks = 1
-
--- Poll the agents and find the panes whose agent left "working".
+-- The agent that yielded its turn is found by the agent_finished event,
+-- which arrives at once.
 --
--- The agent that needs you (working -> waiting_input) is found here, and
--- so is the agent that yielded its turn (working -> idle). The
--- agent_finished event finds the yield at once, but it can arrive before
--- the block's state turns idle, so this poll stays the backstop for it.
-local function poll_agents(cx: WindowCx, candidates: { [number]: string })
-	local started = tern.now()
-	local now_states: { [number]: string } = {}
-	for _, agent in list_agents(cx) do
-		local id = agent.pane
-		now_states[id] = agent.state
-		local prev = agent_state[id]
-		if prev == "working" and (agent.state == "idle" or agent.state == "waiting_input") then
-			if candidates[id] == nil then
-				candidates[id] = if agent.state == "waiting_input" then "alert" else "yield"
-			end
-		end
-	end
-	agent_state = now_states
-
-	-- Keep the tick inside its budget: poll less often when the poll is
-	-- slow, and more often when it is cheap.
-	local took = tern.now() - started
-	if took > AGENT_POLL_SLOW_MS then
-		agent_poll_ticks = math.min(agent_poll_ticks * 2, AGENT_POLL_MAX_TICKS)
-	elseif took < AGENT_POLL_FAST_MS then
-		agent_poll_ticks = math.max(agent_poll_ticks // 2, 1)
-	end
-end
-
+-- The agent that needs you (working -> waiting_input) raises the pane's
+-- own alert flag, so the tick finds it there. Nothing lists the agents:
+-- that call costs 10 to 50 ms on a busy machine, which is more than the
+-- whole budget of a window handler, and a handler that runs over its
+-- budget is disabled until the next reload.
 local function tick_body(cx: WindowCx)
 	tick_count += 1
 	if tick_count % CONFIG_EVERY_TICKS == 0 then
@@ -413,15 +373,11 @@ local function tick_body(cx: WindowCx)
 	end
 	alerts = now_alerts
 
-	if tick_count % agent_poll_ticks == 0 then
-		poll_agents(cx, candidates)
-	end
-
 	for id, kind in candidates do
 		if config.only_unfocused and focused[id] then
 			-- You are looking at it; no chime.
 		else
-			chime(kind, id)
+			chime(kind)
 		end
 	end
 	seeded = true
@@ -469,27 +425,31 @@ tern.on("command_finished", function(ev: CommandFinishedEvent, cx: WindowCx)
 	if config.only_unfocused and info.focused then
 		return
 	end
-	chime("done", ev.pane)
+	chime("done")
 end)
 
--- An agent's turn ended: it yielded its turn, or it needs you.
+-- An agent's turn ended: it yielded its turn.
 --
--- This event arrives at once, so the yield does not wait for the next
--- agent poll. The event does not report a turn that ends while a prompt
--- waits for the agent, so the slow poll still finds that case.
+-- The event arrives at once, so the yield needs no polling. Nothing here
+-- lists the agents: that call costs more than the whole budget of a
+-- window handler on a busy machine, and a handler that runs over its
+-- budget is disabled until the next reload.
+--
+-- The event does not report a turn that ends while a prompt waits for the
+-- agent. That case raises the pane's own alert flag, so the tick finds
+-- it.
 tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
 	local ok, err = try(function()
-		local state = agent_state_of(cx, ev.pane)
-		if state ~= "idle" and state ~= "waiting_input" then
+		if ev.result ~= "done" then
+			-- The agent failed, exited or closed. The pane's alert flag
+			-- covers the cases that need the user.
 			return
 		end
-		-- The agent block's own state moves on; the poll sees it next time.
-		agent_state[ev.pane] = state
 		if config.only_unfocused and pane_focused(cx, ev.pane) then
 			-- You are looking at it; no chime.
 			return
 		end
-		chime(if state == "waiting_input" then "alert" else "yield", ev.pane)
+		chime("yield")
 	end)
 	if not ok then
 		tern.log.warn("Chime: the agent_finished handler failed: " .. err)

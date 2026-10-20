@@ -21,8 +21,7 @@ local SERVE_EVERY_MS = 100 -- the channel is served this often
 local SWEEP_EVERY_MS = 30000 -- stale channel files are swept this often
 local SWEEP_MAX_AGE_S = 60 -- a channel file older than this is stale
 local CONFIG_EVERY_MS = 5000 -- the configuration is re-read this often
-local MIN_GAP_MS = 500 -- two sounds never follow each other faster
-local MOMENT_WINDOW_S = 2 -- a moment stays claimed this long
+local CLAIM_WINDOW_MS = 2000 -- one sound per moment, across every window
 local PLAY_TIMEOUT_MS = 15000 -- a player that runs longer is killed
 local PROBE_TIMEOUT_MS = 5000 -- the player probe gets this long
 local MAX_CONFIG_BYTES = 64 * 1024 -- a bigger configuration is ignored
@@ -430,35 +429,10 @@ end
 
 local last_sound_at = -math.huge
 
--- The moments that already got a sound, with the second they got it.
---
--- Two windows can see the same event a moment apart: a pane raises an
--- alert, and every window notices. One sound must come out of that, not
--- one per window. The window half sends the moment it saw, and the first
--- window to send it plays; the others find it already taken.
-local recent_moments: { [string]: number } = {}
-
--- True when this moment already got a sound, and remember it otherwise.
-local function claim_moment(key: string): boolean
-	local now = os.time()
-	if recent_moments[key] ~= nil then
-		return false
-	end
-	recent_moments[key] = now
-	-- Keep the table small: the moments older than the window do not
-	-- matter.
-	for other, at in recent_moments do
-		if now - at > MOMENT_WINDOW_S then
-			recent_moments[other] = nil
-		end
-	end
-	return true
-end
-
 -- Play the sound of one kind. The answer says whether a sound came out and
--- why not. `ignore_flags` skips the mute flag and the gap, which the test
+-- why not. `ignore_flags` skips the mute flag and the claim, which the test
 -- sound needs.
-local function play_sound(kind: string, ignore_flags: boolean, moment: string?): (boolean, string, string)
+local function play_sound(kind: string, ignore_flags: boolean): (boolean, string, string)
 	local path = sound_of(kind)
 	if path == "" then
 		return false, "", "silent"
@@ -475,12 +449,11 @@ local function play_sound(kind: string, ignore_flags: boolean, moment: string?):
 		return false, path, "missing"
 	end
 	if not ignore_flags then
-		if moment ~= nil and not claim_moment(moment) then
-			-- Another window saw this moment first.
-			return false, path, "moment"
-		end
+		-- One sound per moment. Two windows can see the same event a
+		-- moment apart, and only one sound must come out of it. The host
+		-- half serves every window, so this claim holds for all of them.
 		local now = tern.now()
-		if now - last_sound_at < MIN_GAP_MS then
+		if now - last_sound_at < CLAIM_WINDOW_MS then
 			return false, path, "gap"
 		end
 		last_sound_at = now
@@ -535,14 +508,10 @@ local function handle(request: { [string]: any }): { [string]: any }?
 		if type(kind) ~= "string" then
 			return { ok = false, error = "play needs a kind" }
 		end
-		local moment: string? = nil
-		if type(request.moment) == "string" then
-			moment = request.moment
-		end
-		local played, path, reason = play_sound(kind, false, moment)
+		local played, path, reason = play_sound(kind, false)
 		return { ok = true, played = played, path = path, reason = reason }
 	elseif op == "test" then
-		local played, path, reason = play_sound("yield", true, nil)
+		local played, path, reason = play_sound("yield", true)
 		local exists = false
 		if path ~= "" then
 			local ok_exists, found = pcall(tern.fs.exists, path)

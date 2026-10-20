@@ -271,13 +271,36 @@ end
 
 -- The state the window half reads: the player, the source of the
 -- configuration and the problems of that configuration.
+--
+-- The state is published only when it changed. A publish is a file
+-- write, and the host's 2 s budget covers the whole tick, so a tick
+-- that writes every time leaves the host with no headroom for the
+-- requests it answers.
+local last_published = ""
+
 local function publish_state()
-	shared.publish({
+	-- The problems are an array in the published state. `json.array`
+	-- tags the table, so an empty list of problems encodes as `[]` and
+	-- not as an empty object.
+	local problems: { any } = tern.json.array()
+	for _, problem in config_problems do
+		table.insert(problems, problem)
+	end
+	local state: { [string]: any } = {
 		player = current_player(),
 		source = config_source,
-		problems = if #config_problems > 0 then config_problems else tern.json.array(),
+		problems = problems,
 		updated = os.time(),
-	})
+	}
+	local key = state.player .. "\n" .. state.source
+	for _, problem in problems do
+		key = key .. "\n" .. problem
+	end
+	if key == last_published then
+		return
+	end
+	last_published = key
+	shared.publish(state)
 end
 
 -- Read the configuration and publish the result. A file with the same text

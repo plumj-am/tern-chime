@@ -33,11 +33,14 @@ type Config = {
 
 -- A request this half waits for. The kind names the sound a play request
 -- asks for.
+--
+-- The cx is not kept: a cx is only valid during the call that received
+-- it, and the answer arrives in a later pass. A kept cx is a
+-- destructed one, and a toast on it fails.
 type Pending = {
 	op: string,
 	kind: string?,
 	at: number,
-	cx: WindowCx?,
 }
 
 local TICK_MS = 250
@@ -171,21 +174,46 @@ local pending: { [string]: Pending } = {}
 
 -- The Reload command asks for a new configuration. The answer comes some
 -- time later, so the wish waits here until an answer arrives.
-local reload_wanted: WindowCx? = nil
+--
+-- The wish is a flag, not a cx: the answer arrives in a later pass, and
+-- a cx that was kept until then is a destructed one.
+local reload_wanted = false
 
--- Ask the host half to do something. The name is the key of the answer.
-local function ask(op: string, fields: { [string]: any }, kind: string?, cx: WindowCx?): string?
-	local request: { [string]: any } = { op = op }
-	for key, value in fields do
+-- The requests that are not written yet. `ask` puts them here, and the
+-- tick writes them.
+--
+-- A request is a file write, and a command handler has 50 ms for
+-- everything it does. The write happens in the next tick instead, and
+-- the handler returns at once.
+local queued: { { op: string, fields: { [string]: any }, kind: string? } } = {}
+
+-- Ask the host half to do something. The request is written in the next
+-- tick, and the name of the answer comes back then.
+local function ask(op: string, fields: { [string]: any }, kind: string?): string?
+	table.insert(queued, { op = op, fields = fields, kind = kind })
+	return nil
+end
+
+-- Write the requests that are waiting. One per tick, so a burst of them
+-- does not fill one pass.
+local function write_queued()
+	if #queued == 0 then
+		return
+	end
+	local item = table.remove(queued, 1)
+	if item == nil then
+		return
+	end
+	local request: { [string]: any } = { op = item.op }
+	for key, value in item.fields do
 		request[key] = value
 	end
 	local name = shared.ask(request)
 	if type(name) ~= "string" then
-		tern.log.warn("Chime: the request to the host half failed: " .. op)
-		return nil
+		tern.log.warn("Chime: the request to the host half failed: " .. item.op)
+		return
 	end
-	pending[name] = { op = op, kind = kind, at = tern.now(), cx = cx }
-	return name
+	pending[name] = { op = item.op, kind = item.kind, at = tern.now() }
 end
 
 -- Ask for the configuration, unless a request for it is still on its way.
@@ -195,12 +223,20 @@ local function ask_config()
 			return
 		end
 	end
-	ask("config", {}, nil, nil)
+	-- A request that is queued but not written yet counts as on its
+	-- way: without this the queue grows a config request every time
+	-- the configuration is due.
+	for _, item in queued do
+		if item.op == "config" then
+			return
+		end
+	end
+	ask("config", {}, nil)
 end
 
 -- The Reload command. The answer shows the result.
 local function report_reload(cx: WindowCx?)
-	reload_wanted = nil
+	reload_wanted = false
 	if #config_problems == 0 then
 		toast(cx, "info", "Chime", "Sounds reloaded from " .. config_source)
 	else
@@ -224,8 +260,8 @@ local function handle_reply(entry: Pending, payload: any, cx: WindowCx?)
 	end
 	if entry.op == "config" then
 		apply_config(payload)
-		if reload_wanted ~= nil then
-			report_reload(reload_wanted)
+		if reload_wanted then
+			report_reload(cx)
 		end
 	elseif entry.op == "play" then
 		if payload.played ~= true then
@@ -236,7 +272,8 @@ local function handle_reply(entry: Pending, payload: any, cx: WindowCx?)
 			tern.log.debug("Chime: no " .. (entry.kind or "") .. " sound (" .. reason .. ")")
 		end
 	elseif entry.op == "test" then
-		local target = entry.cx or cx
+		-- The cx is the one from the answer's own pass, so it is alive.
+		local target = cx
 		local path = ""
 		if type(payload.path) == "string" then
 			path = payload.path
@@ -264,7 +301,17 @@ end
 -- are read. Reading one file per pending request would make the tick grow
 -- with the number of pending requests, and a tick that runs over its
 -- budget is disabled until the next reload.
-local function collect_replies(cx: WindowCx?)
+--
+-- An answer is acted on in its own pass. The pass that reads the answers
+-- has already spent part of its 50 ms on the file reads, and an answer
+-- that draws (a toast) spends the rest of it on the draw. The draw runs
+-- the chrome formatters, and a formatter's 4 ms budget is what is left
+-- of the deadline of the call that drew, so a formatter that ran under a
+-- spent deadline was disabled for the rest of the window's life.
+--
+-- `sleep(0)` re-arms the chain as its own `await` hook, so the answer
+-- gets a fresh 50 ms and a fresh cx.
+local function collect_replies(_cx: WindowCx?)
 	local now = tern.now()
 	local ok, names = pcall(tern.fs.list, shared.path(shared.REPLY_DIR))
 	if not ok or type(names) ~= "table" then
@@ -276,7 +323,12 @@ local function collect_replies(cx: WindowCx?)
 			local payload, status = shared.take_reply(name)
 			if status == "ok" then
 				pending[name] = nil
-				handle_reply(entry, payload, cx)
+				tern.sleep(0):next(function(_result, _err, live)
+					if live == nil then
+						return
+					end
+					handle_reply(entry, payload, live)
+				end)
 			end
 		end
 	end
@@ -285,8 +337,8 @@ local function collect_replies(cx: WindowCx?)
 		if now - entry.at > REQUEST_TIMEOUT_MS then
 			pending[name] = nil
 			tern.log.debug("Chime: the host half did not answer the " .. entry.op .. " request")
-			if entry.op == "config" and reload_wanted ~= nil then
-				report_reload(reload_wanted)
+			if entry.op == "config" and reload_wanted then
+				report_reload(nil)
 			end
 		end
 	end
@@ -313,7 +365,7 @@ local function chime(kind: string)
 	if is_muted then
 		return
 	end
-	ask("play", { kind = kind }, kind, nil)
+	ask("play", { kind = kind }, kind)
 end
 
 local function list_agents(cx: WindowCx): { AgentBlock }
@@ -351,6 +403,9 @@ local tick_count = 0
 -- budget is disabled until the next reload.
 local function tick_body(cx: WindowCx)
 	tick_count += 1
+	-- The requests that are waiting are written first: a request that
+	-- waits for its answer waits for the write too.
+	write_queued()
 	if tick_count % CONFIG_EVERY_TICKS == 0 then
 		ask_config()
 	end
@@ -474,8 +529,8 @@ tern.command({
 	id = "test",
 	title = "Chime: Play test sound",
 	icon = "bell",
-	run = function(cx: WindowCx)
-		ask("test", {}, nil, cx)
+	run = function(_cx: WindowCx)
+		ask("test", {}, nil)
 	end,
 })
 
@@ -485,7 +540,7 @@ tern.command({
 	icon = "bell",
 	run = function(cx: WindowCx)
 		-- The answer comes later, so the wish waits for it.
-		reload_wanted = cx
+		reload_wanted = true
 		ask_config()
 	end,
 })

@@ -13,6 +13,28 @@ tern plugin install https://github.com/H4vC/tern-chime
 
 For development, `tern plugin link /path/to/tern-chime`.
 
+## Two halves
+
+The plugin runs in two parts. The window half (`src/window.luau`) decides
+when a sound is due: it watches panes for unseen alerts, watches agents for a
+finished turn, and watches for long shell commands. The host half
+(`src/host.luau`) does the heavy work: it reads and parses `sounds.toml`,
+finds a sound player, and starts it. The two halves talk through files in
+the plugin's data folder.
+
+The split is there because the window half runs on the window's UI thread
+with a tight time budget, and reading a config file, probing for a player
+and starting one do not belong there. The host half runs in the session
+daemon on its own worker thread, where there is much more room.
+
+Nothing changes for you. The sounds, the commands and the config file work
+as before: the config still lives in `sounds.toml`, it is still re-read every
+few seconds, and the mute toggle still shows in the status line.
+
+One consequence is worth stating plainly: the sound now plays on the machine
+that runs the session daemon. For a normal local session that is the same
+machine as the window. The window half decides, the host half plays.
+
 ## Platforms
 
 | OS | Player | Notes | Volume |

@@ -2,7 +2,7 @@
 -- Chime: a sound when a pane raises an unseen alert, an agent yields to you,
 -- or a long shell command finishes.
 --
--- Triggers (all for panes you are not looking at, unless only_unfocused=false):
+-- This is the window half. It decides WHEN a sound is due:
 --   alert  a pane's unseen-alert flag rises: a terminal bell, an agent that
 --          finished or is waiting out of sight, or a pane whose program
 --          exited. Tern shows one alert per pane until you look at it, so a
@@ -12,14 +12,18 @@
 --          alert sound instead: it needs you, not just your attention.)
 --   done   a shell command ran longer than min_seconds and finished.
 --
--- Chimes never overlap: simultaneous events share one chime, and a chime in
--- one window suppresses the same moment's chime in every other window.
+-- The host half decides WHETHER the sound plays and plays it. It reads
+-- sounds.toml, finds a sound player, owns the mute flag and owns the 500 ms
+-- gap between two chimes. One host half serves every window, so a chime in
+-- one window no longer has to suppress the same moment's chime in another.
 --
--- Configuration is sounds.toml in the plugin folder (ships with defaults) or
--- <plugin data>/sounds.toml, which wins when present so a reinstall keeps
--- your sounds. It is re-read every few seconds; no reload needed. The optional
--- volume key (whole percent, 1-100) scales playback where the platform player
--- takes a volume; a player without one ignores it.
+-- The two halves talk through the channel in src/shared.luau. This half
+-- asks the host half to play, and the host half answers. This half holds
+-- no player, reads no configuration file and keeps no gap logic. It keeps
+-- the configuration the host half sent, the cached mute flag, and the
+-- requests it waits for.
+--
+-- Triggers are for panes you are not looking at, unless only_unfocused=false.
 
 type Config = {
 	sounds: { [string]: string },
@@ -28,369 +32,289 @@ type Config = {
 	volume: number,
 }
 
+-- A request this half waits for. The kind names the sound a play request
+-- asks for.
+type Pending = {
+	op: string,
+	kind: string?,
+	at: number,
+	cx: WindowCx?,
+}
+
 local TICK_MS = 250
-local CONFIG_EVERY_TICKS = 20 -- re-read sounds.toml about every 5 s
-local MIN_GAP_MS = 500 -- chimes never overlap
-local CLAIM_WINDOW_S = 2 -- cross-window dedup: one chime per moment
+local CONFIG_EVERY_TICKS = 20 -- ask the host half for the configuration about every 5 s
+local REQUEST_TIMEOUT_MS = 10000 -- a request with no answer is dropped
+local SWEEP_EVERY_MS = 30000 -- stale channel files are swept this often
+local SWEEP_MAX_AGE_S = 60 -- a channel file older than this is stale
+
+-- Listing the agents costs about 10 to 20 ms and grows with the number of
+-- agents and the size of their last answers. The window's budget is 50 ms
+-- per handler, and a handler that runs over its budget is disabled until
+-- the next reload, so the agent poll runs on its own, slower interval.
+local AGENT_POLL_SLOW_MS = 20 -- a poll over this is too slow for every tick
+local AGENT_POLL_FAST_MS = 10 -- a poll under this can run every tick
+local AGENT_POLL_MAX_TICKS = 16 -- at most one agent poll every 4 s
 
 local SEP = if tern.runtime.os == "windows" then "\\" else "/"
-local DATA_SEP = tern.plugin.data .. SEP
-local DATA_CONFIG = DATA_SEP .. "sounds.toml"
-local PLUGIN_CONFIG = tern.plugin.dir .. SEP .. "sounds.toml"
 
--- Config ----------------------------------------------------------------------------------
+-- The channel --------------------------------------------------------------------------------
 
-local function trim(s: string): string
-	return (string.gsub(s, "^%s*(.-)%s*$", "%1"))
+-- The shared module is loaded with loadstring, not with require: the Nix
+-- deployment links every plugin file into the plugins folder, and require
+-- refuses to resolve a module that is a symlink.
+local shared_ok, shared = pcall(function()
+	local chunk = loadstring(tern.fs.read(tern.plugin.dir .. "/src/shared.luau"))
+	if chunk == nil then
+		return nil
+	end
+	return chunk()
+end)
+if not shared_ok or shared == nil then
+	tern.log.error("Chime: could not load src/shared.luau: " .. tostring(shared))
+	return
 end
 
--- Cut a `#` comment, keeping `#` inside quotes.
-local function strip_comment(line: string): string
-	local in_single = false
-	local in_double = false
-	local i = 1
-	while i <= #line do
-		local c = string.sub(line, i, i)
-		if c == "\\" and (in_single or in_double) then
-			i += 2
-		elseif c == "'" and not in_double then
-			in_single = not in_single
-			i += 1
-		elseif c == '"' and not in_single then
-			in_double = not in_double
-			i += 1
-		elseif c == "#" and not in_single and not in_double then
-			return string.sub(line, 1, i - 1)
-		else
-			i += 1
+-- Run a function and report the error it raised. The error message is
+-- empty when the function worked.
+local function try(fn: () -> ()): (boolean, string)
+	local ok, err = pcall(function(): string
+		fn()
+		return ""
+	end)
+	if ok then
+		return true, ""
+	end
+	return false, tostring(err)
+end
+
+-- Show a toast. A window that has no context yet writes to the log.
+local function toast(cx: WindowCx?, level: ToastLevel, text: string, sub: string)
+	if cx == nil then
+		tern.log.info("Chime: " .. text .. ": " .. sub)
+		return
+	end
+	local ok, err = try(function()
+		cx:toast(level, text, sub)
+	end)
+	if not ok then
+		tern.log.warn("Chime: the toast failed: " .. err)
+	end
+end
+
+-- The configuration ---------------------------------------------------------------------------
+
+-- The configuration the host half sent. This half reads no file; it keeps
+-- what the host half parsed. The values here are the fallbacks that hold
+-- until the first answer arrives.
+local config: Config = {
+	sounds = { alert = "", yield = "", done = "" },
+	only_unfocused = true,
+	min_seconds = 30,
+	volume = 100,
+}
+local config_source = "(defaults)"
+local config_problems: { string } = {}
+
+-- The strings of a JSON array. A decoded array comes back array-tagged, so
+-- the list is read entry by entry.
+local function string_list(value: any): { string }
+	local out: { string } = {}
+	if type(value) ~= "table" then
+		return out
+	end
+	for _, item in value do
+		if type(item) == "string" then
+			table.insert(out, item)
 		end
 	end
-	return line
+	return out
 end
 
--- A quoted value without its quotes, or nil when not quoted. Only the
--- matching quote and the backslash unescape, so Windows paths work as-is
--- in double quotes (`"C:\sounds\ping.wav"` needs no doubling).
-local function unquote(s: string): string?
-	if #s < 2 then
+-- Take the configuration from the host half's answer.
+local function apply_config(payload: any)
+	if type(payload) ~= "table" then
+		return
+	end
+	local raw = payload.config
+	if type(raw) == "table" then
+		local sounds = raw.sounds
+		if type(sounds) == "table" then
+			for _, kind in { "alert", "yield", "done" } do
+				local value = sounds[kind]
+				if type(value) == "string" then
+					config.sounds[kind] = value
+				end
+			end
+		end
+		if type(raw.only_unfocused) == "boolean" then
+			config.only_unfocused = raw.only_unfocused
+		end
+		if type(raw.min_seconds) == "number" then
+			config.min_seconds = raw.min_seconds
+		end
+		if type(raw.volume) == "number" then
+			config.volume = raw.volume
+		end
+	end
+	if type(payload.source) == "string" then
+		config_source = payload.source
+	end
+	config_problems = string_list(payload.problems)
+end
+
+-- The host half reports a sound file that is not there as a problem that
+-- starts with the kind and ": file not found:".
+local function missing_sound(problems: { string }, kind: string): boolean
+	local prefix = kind .. ": file not found:"
+	for _, problem in problems do
+		if string.sub(problem, 1, #prefix) == prefix then
+			return true
+		end
+	end
+	return false
+end
+
+-- The requests --------------------------------------------------------------------------------
+
+local pending: { [string]: Pending } = {}
+
+-- The Reload command asks for a new configuration. The answer comes some
+-- time later, so the wish waits here until an answer arrives.
+local reload_wanted: WindowCx? = nil
+
+-- Ask the host half to do something. The name is the key of the answer.
+local function ask(op: string, fields: { [string]: any }, kind: string?, cx: WindowCx?): string?
+	local request: { [string]: any } = { op = op }
+	for key, value in fields do
+		request[key] = value
+	end
+	local name = shared.ask(request)
+	if type(name) ~= "string" then
+		tern.log.warn("Chime: the request to the host half failed: " .. op)
 		return nil
 	end
-	local first = string.sub(s, 1, 1)
-	if first ~= '"' and first ~= "'" then
-		return nil
+	pending[name] = { op = op, kind = kind, at = tern.now(), cx = cx }
+	return name
+end
+
+-- Ask for the configuration, unless a request for it is still on its way.
+local function ask_config()
+	for _, entry in pending do
+		if entry.op == "config" then
+			return
+		end
 	end
-	if string.sub(s, -1) ~= first then
-		return nil
-	end
-	local inner = string.sub(s, 2, -2)
-	if first == '"' then
-		inner = string.gsub(inner, '\\"', '"')
-		inner = string.gsub(inner, "\\\\", "\\")
+	ask("config", {}, nil, nil)
+end
+
+-- The Reload command. The answer shows the result.
+local function report_reload(cx: WindowCx?)
+	reload_wanted = nil
+	if #config_problems == 0 then
+		toast(cx, "info", "Chime", "Sounds reloaded from " .. config_source)
 	else
-		inner = string.gsub(inner, "\\'", "'")
+		toast(cx, "error", "Chime", table.concat(config_problems, "\n"))
 	end
-	return inner
 end
 
-local function default_config(): Config
-	local dir = tern.plugin.dir .. SEP .. "sounds"
-	return {
-		sounds = {
-			alert = dir .. SEP .. "alert.wav",
-			yield = dir .. SEP .. "yield.wav",
-			done = dir .. SEP .. "done.wav",
-		},
-		only_unfocused = true,
-		min_seconds = 30,
-		volume = 100,
-	}
-end
-
-local function is_absolute(p: string): boolean
-	if string.sub(p, 1, 1) == "/" then
-		return true
+-- Act on one answer from the host half.
+local function handle_reply(entry: Pending, payload: any, cx: WindowCx?)
+	if type(payload) ~= "table" then
+		tern.log.warn("Chime: the host half sent an answer that is not a table")
+		return
 	end
-	return string.match(p, "^[A-Za-z]:[\\/]") ~= nil or string.sub(p, 1, 2) == "\\\\"
-end
-
-local function resolve_path(p: string, base: string): string
-	if string.sub(p, 1, 1) == "~" then
-		local home = tern.getenv("HOME") or tern.getenv("USERPROFILE") or ""
-		if home ~= "" then
-			p = home .. string.sub(p, 2)
+	if payload.ok ~= true then
+		local detail = "unknown error"
+		if type(payload.error) == "string" then
+			detail = payload.error
+		end
+		tern.log.warn("Chime: the host half refused the request: " .. detail)
+		return
+	end
+	if entry.op == "config" then
+		apply_config(payload)
+		if reload_wanted ~= nil then
+			report_reload(reload_wanted)
+		end
+	elseif entry.op == "play" then
+		if payload.played ~= true then
+			local reason = ""
+			if type(payload.reason) == "string" then
+				reason = payload.reason
+			end
+			tern.log.debug("Chime: no " .. (entry.kind or "") .. " sound (" .. reason .. ")")
+		end
+	elseif entry.op == "test" then
+		local target = entry.cx or cx
+		local path = ""
+		if type(payload.path) == "string" then
+			path = payload.path
+		end
+		local reason = ""
+		if type(payload.reason) == "string" then
+			reason = payload.reason
+		end
+		if reason == "missing" then
+			toast(target, "error", "Chime", "Missing: " .. path)
+		elseif reason == "silent" and path == "" then
+			toast(target, "error", "Chime", "No yield sound configured")
+		elseif payload.played == true then
+			toast(target, "info", "Chime", "Playing " .. path)
+		else
+			toast(target, "error", "Chime", "Could not play " .. path)
 		end
 	end
-	if is_absolute(p) then
-		return p
-	end
-	return base .. SEP .. p
 end
 
-local function parse_config(text: string, base: string): (Config, { string })
-	local config = default_config()
-	local problems: { string } = {}
-	for raw in string.gmatch(text, "[^\r\n]+") do
-		local line = trim(strip_comment(raw))
-		if line ~= "" then
-			local key, value = string.match(line, "^([A-Za-z_][%w_]*)%s*=%s*(.-)%s*$")
-			if key == nil or value == nil or value == "" then
-				table.insert(problems, "Skipping line: " .. line)
-			elseif key == "alert" or key == "yield" or key == "done" then
-				local quoted = unquote(value)
-				if quoted == nil then
-					table.insert(problems, key .. ": expected a quoted path, got " .. value)
-				elseif quoted == "" then
-					config.sounds[key] = ""
-				else
-					config.sounds[key] = resolve_path(quoted, base)
-				end
-			elseif key == "only_unfocused" then
-				if value == "true" then
-					config.only_unfocused = true
-				elseif value == "false" then
-					config.only_unfocused = false
-				else
-					table.insert(problems, "only_unfocused: expected true or false, got " .. value)
-				end
-			elseif key == "min_seconds" then
-				local n = tonumber(value)
-				if n == nil or n < 0 then
-					table.insert(problems, "min_seconds: expected seconds >= 0, got " .. value)
-				else
-					config.min_seconds = n
-				end
-			elseif key == "volume" then
-				local n = tonumber(value)
-				if n == nil or n % 1 ~= 0 or n < 1 or n > 100 then
-					table.insert(problems, "volume: expected a whole number between 1 and 100, got " .. value)
-				else
-					config.volume = n
-				end
-			else
-				table.insert(problems, "Unknown key: " .. key)
+-- Read the answers that arrived. A request that waits more than ten
+-- seconds is dropped.
+local function collect_replies(cx: WindowCx?)
+	local now = tern.now()
+	for name, entry in pending do
+		local payload, status = shared.take_reply(name)
+		if status == "ok" then
+			pending[name] = nil
+			handle_reply(entry, payload, cx)
+		elseif status == "corrupt" then
+			-- Half an answer: read it again on the next tick.
+		elseif now - entry.at > REQUEST_TIMEOUT_MS then
+			pending[name] = nil
+			tern.log.debug("Chime: the host half did not answer the " .. entry.op .. " request")
+			if entry.op == "config" and reload_wanted ~= nil then
+				report_reload(reload_wanted)
 			end
 		end
 	end
-	return config, problems
 end
 
-local config = default_config()
-local config_source = "(defaults)"
-local config_key: string? = nil
-local warned: { [string]: boolean } = {}
-
--- The data-folder config wins when it reads; the shipped one is the fallback.
-local function read_config_file(): (string?, string?)
-	for _, path in { DATA_CONFIG, PLUGIN_CONFIG } do
-		local ok, text = pcall(tern.fs.read, path, 64 * 1024)
-		if ok and type(text) == "string" then
-			return text :: string, path
-		end
-	end
-	return nil, nil
-end
-
-local function load_config(): { string }
-	local text, path = read_config_file()
-	if text == nil or path == nil then
-		config = default_config()
-		config_source = "(defaults)"
-		warned = {}
-		return {}
-	end
-	local parsed, problems = parse_config(text, if path == DATA_CONFIG then tern.plugin.data else tern.plugin.dir)
-	config = parsed
-	config_source = path
-	warned = {}
-	for kind, sound in config.sounds do
-		if sound ~= "" and not tern.fs.exists(sound) then
-			table.insert(problems, kind .. ": file not found: " .. sound)
-		end
-	end
-	return problems
-end
-
-local function snapshot_key(): string?
-	local text, path = read_config_file()
-	if text == nil or path == nil then
-		return nil
-	end
-	return path .. "\n" .. text
-end
-
-local function maybe_reload_config()
-	local key = snapshot_key()
-	if key == config_key then
-		return
-	end
-	config_key = key
-	local problems = load_config()
-	if #problems > 0 then
-		tern.log.warn("Chime: " .. table.concat(problems, "; "))
-	end
-end
-
--- Mute + cross-window claim -----------------------------------------------------------------
+-- Mute -----------------------------------------------------------------------------------------
 
 local is_muted = false
 
+-- The mute flag lives in the key-value store, because the chrome segment
+-- needs it and the chrome formatter may not touch the file system. The
+-- host half reads the same flag before it plays.
 local function refresh_muted()
 	local ok, value = pcall(tern.kv.get, "muted")
 	is_muted = ok and value == true
 end
 
--- One chime per moment across windows: whoever claims it plays it.
-local function claim_chime(): boolean
-	local now_s = os.time()
-	local ok, at = pcall(tern.kv.get, "last_chime")
-	if ok and type(at) == "number" and now_s - (at :: number) < CLAIM_WINDOW_S then
-		return false
-	end
-	pcall(tern.kv.set, "last_chime", now_s)
-	return true
-end
+-- Triggers ------------------------------------------------------------------------------------
 
--- Playback ----------------------------------------------------------------------------------
-
-local function spawn(argv: { string }, path: string)
-	local ok, err = pcall(function()
-		tern.process.run(argv, { timeout_ms = 15000 }, function(result: ProcessResult)
-			if result.timed_out then
-				tern.log.warn("Chime: playing " .. path .. " timed out")
-			elseif result.status ~= 0 then
-				local detail = if result.stderr ~= "" then result.stderr else "exit " .. tostring(result.status)
-				tern.log.warn("Chime: couldn't play " .. path .. ": " .. trim(detail))
-			end
-		end)
-	end)
-	if not ok then
-		tern.log.warn("Chime: couldn't start the player: " .. tostring(err))
-	end
-end
-
-local linux_player: string? = nil
-local linux_probe_failed = false
-local linux_probing = false
-local linux_queue: { string } = {}
-
--- Preference order: PipeWire-native first (pw-play ships with pipewire),
--- then PulseAudio, ALSA, then the heavy/general players.
-local LINUX_PLAYERS = { "pw-play", "paplay", "aplay", "ffplay", "play" }
-
--- Volume as a 0-1 fraction, the form pw-play, sox play and afplay take.
-local function volume_fraction(volume: number): string
-	return string.format("%.4g", volume / 100)
-end
-
-local function linux_argv(player: string, path: string, volume: number): { string }
-	if player == "ffplay" then
-		return { "ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-volume", tostring(volume), path }
-	elseif player == "play" then
-		return { "play", "-q", "-v", volume_fraction(volume), path }
-	elseif player == "aplay" then
-		-- aplay has no volume flag; it ignores the volume and plays at full volume.
-		return { "aplay", "-q", path }
-	elseif player == "paplay" then
-		-- PulseAudio takes a volume in 1/65536ths (PA_VOLUME_NORM).
-		return { "paplay", "--volume=" .. tostring(math.round(volume * 65536 / 100)), path }
-	else
-		return { "pw-play", "--volume=" .. volume_fraction(volume), path }
-	end
-end
-
-local function probe_linux_player()
-	if linux_probing or linux_probe_failed or linux_player ~= nil then
+-- Ask the host half to play a sound. The host half holds the gap, the
+-- mute flag and the player, so it decides whether a sound comes out. The
+-- cached mute state stops this half from asking when the user muted.
+--
+-- The moment names the pane, the kind and the second. Two windows that
+-- see the same event send the same moment, and the host half plays it
+-- once.
+local function chime(kind: string, pane: number?)
+	if is_muted then
 		return
 	end
-	linux_probing = true
-	-- One probe per player would serialize N spawns; instead ask sh for the
-	-- first match in preference order and read back which one answered.
-	local names = table.concat(LINUX_PLAYERS, " ")
-	local ok, err = pcall(function()
-		tern.process.run(
-			{ "sh", "-c", "for p in " .. names .. "; do command -v $p >/dev/null 2>&1 && { echo $p; exit 0; }; done; exit 1" },
-			{ timeout_ms = 5000 },
-			function(result: ProcessResult)
-				linux_probing = false
-				local name = string.match(result.stdout, "([%w-]+)")
-				if result.status == 0 and name ~= nil and name ~= "" then
-					linux_player = name
-					for _, path in linux_queue do
-						spawn(linux_argv(name, path, config.volume), path)
-					end
-				else
-					linux_probe_failed = true
-					tern.log.warn("Chime: no sound player found (need one of: " .. names .. ")")
-				end
-				linux_queue = {}
-			end
-		)
-	end)
-	if not ok then
-		linux_probing = false
-		linux_probe_failed = true
-		linux_queue = {}
-		tern.log.warn("Chime: couldn't probe for a sound player: " .. tostring(err))
-	end
+	local moment = tostring(pane or 0) .. ":" .. kind .. ":" .. tostring(os.time())
+	ask("play", { kind = kind, moment = moment }, kind, nil)
 end
-
-local warned_no_player = false
-
-local function play_file(path: string)
-	local os_name = tern.runtime.os
-	if os_name == "ios" then
-		return
-	elseif os_name == "windows" then
-		-- Via wscript (a windowless GUI host): spawning hidden PowerShell
-		-- directly still flashes a console box on creation. SoundPlayer
-		-- takes WAV only, and has no volume control, so `volume` is ignored
-		-- here (see sounds.toml).
-		spawn({ "wscript.exe", "//Nologo", tern.plugin.dir .. SEP .. "scripts" .. SEP .. "play.vbs", path }, path)
-	elseif os_name == "macos" then
-		spawn({ "afplay", "-v", volume_fraction(config.volume), path }, path)
-	elseif os_name == "linux" then
-		local player = linux_player
-		if player ~= nil then
-			spawn(linux_argv(player, path, config.volume), path)
-		elseif not linux_probe_failed then
-			table.insert(linux_queue, path)
-			probe_linux_player()
-		elseif not warned_no_player then
-			warned_no_player = true
-			tern.log.warn("Chime: silent (no Linux player; install pipewire-pulse, alsa-utils, sox or ffmpeg)")
-		end
-	else
-		tern.log.warn("Chime: no player for " .. os_name)
-	end
-end
-
-local last_chime_at = -math.huge
-
-local function chime(kind: string, _pane: number)
-	local path = config.sounds[kind]
-	if path == nil or path == "" or is_muted then
-		return
-	end
-	local ok_exists, exists = pcall(tern.fs.exists, path)
-	if not ok_exists or not exists then
-		if not warned[path] then
-			warned[path] = true
-			tern.log.warn("Chime: " .. kind .. " sound not found: " .. path)
-		end
-		return
-	end
-	local now = tern.now()
-	if now - last_chime_at < MIN_GAP_MS then
-		return
-	end
-	if not claim_chime() then
-		return
-	end
-	last_chime_at = now
-	play_file(path)
-end
-
--- Triggers ----------------------------------------------------------------------------------
 
 local function list_agents(cx: WindowCx): { AgentBlock }
 	local ok, agents = pcall(function()
@@ -402,17 +326,76 @@ local function list_agents(cx: WindowCx): { AgentBlock }
 	return {}
 end
 
+-- The state of one agent block, or an empty string when the pane holds no
+-- agent.
+local function agent_state_of(cx: WindowCx, pane: number): string
+	for _, agent in list_agents(cx) do
+		if agent.pane == pane then
+			return agent.state
+		end
+	end
+	return ""
+end
+
+-- The pane an agent block runs in, and whether the user looks at it.
+local function pane_focused(cx: WindowCx, pane: number): boolean
+	local ok, info = pcall(function(): PaneInfo?
+		return cx.session:pane(pane)
+	end)
+	if not ok or info == nil then
+		return false
+	end
+	return info.focused == true
+end
+
 local alerts: { [number]: boolean } = {}
 local agent_state: { [number]: string } = {}
 local seeded = false
 local tick_count = 0
 
+-- How many ticks pass between two agent polls. It starts at one, so a
+-- quiet machine polls every tick, and it grows when the poll turns out to
+-- be slow.
+local agent_poll_ticks = 1
+
+-- Poll the agents and find the panes whose agent left "working".
+--
+-- The agent that needs you (working -> waiting_input) is found here, and
+-- so is the agent that yielded its turn (working -> idle). The
+-- agent_finished event finds the yield at once, but it can arrive before
+-- the block's state turns idle, so this poll stays the backstop for it.
+local function poll_agents(cx: WindowCx, candidates: { [number]: string })
+	local started = tern.now()
+	local now_states: { [number]: string } = {}
+	for _, agent in list_agents(cx) do
+		local id = agent.pane
+		now_states[id] = agent.state
+		local prev = agent_state[id]
+		if prev == "working" and (agent.state == "idle" or agent.state == "waiting_input") then
+			if candidates[id] == nil then
+				candidates[id] = if agent.state == "waiting_input" then "alert" else "yield"
+			end
+		end
+	end
+	agent_state = now_states
+
+	-- Keep the tick inside its budget: poll less often when the poll is
+	-- slow, and more often when it is cheap.
+	local took = tern.now() - started
+	if took > AGENT_POLL_SLOW_MS then
+		agent_poll_ticks = math.min(agent_poll_ticks * 2, AGENT_POLL_MAX_TICKS)
+	elseif took < AGENT_POLL_FAST_MS then
+		agent_poll_ticks = math.max(agent_poll_ticks // 2, 1)
+	end
+end
+
 local function tick_body(cx: WindowCx)
 	tick_count += 1
 	if tick_count % CONFIG_EVERY_TICKS == 0 then
-		maybe_reload_config()
+		ask_config()
 	end
 	refresh_muted()
+	collect_replies(cx)
 
 	-- One candidate per pane; the alert edge wins over a same-tick yield.
 	local candidates: { [number]: string } = {}
@@ -430,18 +413,9 @@ local function tick_body(cx: WindowCx)
 	end
 	alerts = now_alerts
 
-	local now_states: { [number]: string } = {}
-	for _, agent in list_agents(cx) do
-		local id = agent.pane
-		now_states[id] = agent.state
-		local prev = agent_state[id]
-		if prev == "working" and (agent.state == "idle" or agent.state == "waiting_input") then
-			if candidates[id] == nil then
-				candidates[id] = if agent.state == "waiting_input" then "alert" else "yield"
-			end
-		end
+	if tick_count % agent_poll_ticks == 0 then
+		poll_agents(cx, candidates)
 	end
-	agent_state = now_states
 
 	for id, kind in candidates do
 		if config.only_unfocused and focused[id] then
@@ -459,13 +433,28 @@ local function tick(cx: WindowCx?)
 	if cx == nil then
 		return
 	end
-	local ok, err = pcall(tick_body, cx :: WindowCx)
+	local ok, err = try(function()
+		tick_body(cx :: WindowCx)
+	end)
 	if not ok then
-		tern.log.warn("Chime tick failed: " .. tostring(err))
+		tern.log.warn("Chime tick failed: " .. err)
+	end
+end
+
+-- The channel files of a window that went away stay behind otherwise.
+local function sweep_tick(_cx: WindowCx?)
+	tern.timer(SWEEP_EVERY_MS, sweep_tick)
+	local ok, err = try(function()
+		shared.sweep(shared.REQUEST_DIR, SWEEP_MAX_AGE_S)
+		shared.sweep(shared.REPLY_DIR, SWEEP_MAX_AGE_S)
+	end)
+	if not ok then
+		tern.log.warn("Chime: sweeping the channel failed: " .. err)
 	end
 end
 
 tern.timer(TICK_MS, tick)
+tern.timer(SWEEP_EVERY_MS, sweep_tick)
 
 tern.on("command_finished", function(ev: CommandFinishedEvent, cx: WindowCx)
 	if ev.took_ms < config.min_seconds * 1000 then
@@ -481,6 +470,30 @@ tern.on("command_finished", function(ev: CommandFinishedEvent, cx: WindowCx)
 		return
 	end
 	chime("done", ev.pane)
+end)
+
+-- An agent's turn ended: it yielded its turn, or it needs you.
+--
+-- This event arrives at once, so the yield does not wait for the next
+-- agent poll. The event does not report a turn that ends while a prompt
+-- waits for the agent, so the slow poll still finds that case.
+tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
+	local ok, err = try(function()
+		local state = agent_state_of(cx, ev.pane)
+		if state ~= "idle" and state ~= "waiting_input" then
+			return
+		end
+		-- The agent block's own state moves on; the poll sees it next time.
+		agent_state[ev.pane] = state
+		if config.only_unfocused and pane_focused(cx, ev.pane) then
+			-- You are looking at it; no chime.
+			return
+		end
+		chime(if state == "waiting_input" then "alert" else "yield", ev.pane)
+	end)
+	if not ok then
+		tern.log.warn("Chime: the agent_finished handler failed: " .. err)
+	end
 end)
 
 -- Palette + status ----------------------------------------------------------------------------
@@ -502,18 +515,7 @@ tern.command({
 	title = "Chime: Play test sound",
 	icon = "bell",
 	run = function(cx: WindowCx)
-		local path = config.sounds["yield"]
-		if path == nil or path == "" then
-			cx:toast("error", "Chime", "No yield sound configured")
-			return
-		end
-		local ok_exists, exists = pcall(tern.fs.exists, path)
-		if not ok_exists or not exists then
-			cx:toast("error", "Chime", "Missing: " .. path)
-			return
-		end
-		play_file(path)
-		cx:toast("info", "Chime", "Playing " .. path)
+		ask("test", {}, nil, cx)
 	end,
 })
 
@@ -522,13 +524,9 @@ tern.command({
 	title = "Chime: Reload sounds",
 	icon = "bell",
 	run = function(cx: WindowCx)
-		config_key = snapshot_key()
-		local problems = load_config()
-		if #problems == 0 then
-			cx:toast("info", "Chime", "Sounds reloaded from " .. config_source)
-		else
-			cx:toast("error", "Chime", table.concat(problems, "\n"))
-		end
+		-- The answer comes later, so the wish waits for it.
+		reload_wanted = cx
+		ask_config()
 	end,
 })
 
@@ -537,8 +535,27 @@ tern.command({
 	title = "Chime: Diagnose panes and agents",
 	icon = "bell",
 	run = function(cx: WindowCx)
+		-- The state file names the player the host half uses.
+		local state = shared.read_state()
+		local player = ""
+		local state_source = ""
+		local state_problems: { string } = {}
+		if type(state) == "table" then
+			if type(state.player) == "string" then
+				player = state.player
+			end
+			if type(state.source) == "string" then
+				state_source = state.source
+			end
+			state_problems = string_list(state.problems)
+		end
+		local source = config_source
+		if source == "(defaults)" and state_source ~= "" then
+			source = state_source
+		end
 		local lines: { string } = {}
-		table.insert(lines, "config: " .. config_source)
+		table.insert(lines, "config: " .. source)
+		table.insert(lines, "player: " .. (if player ~= "" then player else "(none)"))
 		table.insert(lines, "muted: " .. tostring(is_muted))
 		table.insert(lines, "only_unfocused: " .. tostring(config.only_unfocused))
 		table.insert(lines, "min_seconds: " .. tostring(config.min_seconds))
@@ -546,9 +563,9 @@ tern.command({
 		for _, kind in { "alert", "yield", "done" } do
 			local path = config.sounds[kind]
 			local mark = "(off)"
-			if path ~= nil and path ~= "" then
-				local ok_exists, exists = pcall(tern.fs.exists, path)
-				mark = path .. (if ok_exists and exists then "" else "  MISSING")
+			if path ~= "" then
+				local gone = missing_sound(config_problems, kind) or missing_sound(state_problems, kind)
+				mark = path .. (if gone then "  MISSING" else "")
 			end
 			table.insert(lines, kind .. " = " .. mark)
 		end
@@ -591,11 +608,13 @@ tern.command({
 			)
 		end
 		local out = tern.plugin.data .. SEP .. "diagnose.txt"
-		local ok_write, err = pcall(tern.fs.write, out, table.concat(lines, "\n") .. "\n")
+		local ok_write, err = try(function()
+			tern.fs.write(out, table.concat(lines, "\n") .. "\n")
+		end)
 		if ok_write then
 			cx:toast("info", "Chime", "Wrote " .. out)
 		else
-			cx:toast("error", "Chime", "Couldn't write " .. out .. ": " .. tostring(err))
+			cx:toast("error", "Chime", "Couldn't write " .. out .. ": " .. err)
 		end
 	end,
 })
@@ -611,8 +630,4 @@ end)
 -- Startup -------------------------------------------------------------------------------------
 
 refresh_muted()
-config_key = snapshot_key()
-local startup_problems = load_config()
-if #startup_problems > 0 then
-	tern.log.warn("Chime: " .. table.concat(startup_problems, "; "))
-end
+ask_config()

@@ -7,25 +7,36 @@ window's chime suppresses the same moment's chime in every other window.
 
 ## Install
 
+The plugin has two halves, and the host half is not on `main` yet. Install
+the branch that carries it:
+
 ```sh
-tern plugin install https://github.com/H4vC/tern-chime
+tern plugin install https://github.com/plumj-am/tern-chime#patch/PlumJam-tmtylltqsswz
 ```
+
+Installing `main` gives the window half alone. It has no host half to ask,
+so it stays silent.
 
 For development, `tern plugin link /path/to/tern-chime`.
 
 ## Two halves
 
 The plugin runs in two parts. The window half (`src/window.luau`) decides
-when a sound is due: it watches panes for unseen alerts, watches agents for a
-finished turn, and watches for long shell commands. The host half
-(`src/host.luau`) does the heavy work: it reads and parses `sounds.toml`,
-finds a sound player, and starts it. The two halves talk through files in
-the plugin's data folder.
+when a sound is due: it watches panes for unseen alerts, watches for long
+shell commands, and takes the agent_finished event for an agent that
+yielded its turn. The host half (`src/host.luau`) does the heavy work: it
+reads and parses `sounds.toml`, finds a sound player, and starts it. The
+two halves talk through files in the plugin's data folder.
 
 The split is there because the window half runs on the window's UI thread
 with a tight time budget, and reading a config file, probing for a player
 and starting one do not belong there. The host half runs in the session
 daemon on its own worker thread, where there is much more room.
+
+Two triggers follow from that split. An agent that needs you raises the
+pane's own alert flag, so it chimes as an alert. An agent that yielded its
+turn chimes through the agent_finished event, so a turn that ended in a
+failure does not chime: only a turn that finished does.
 
 Nothing changes for you. The sounds, the commands and the config file work
 as before: the config still lives in `sounds.toml`, it is still re-read every
